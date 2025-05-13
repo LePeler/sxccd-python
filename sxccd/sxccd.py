@@ -36,7 +36,7 @@ class Camera():
         except:
             raise("Unknown camera model")
 
-    def parameters(self):
+    def get_ccd_parameters(self):
         # get CCD parameters
         result = self.dev.ctrl_transfer(0xC0, 8, 0, 0, 17)
         params = {}
@@ -49,7 +49,23 @@ class Camera():
         params["pixel_width"] = decLH(result[8:10]) / 256.0
         params["pixel_height"] = decLH(result[10:12]) / 256.0
         params["color_matrix"] = decLH(result[12:14])
+        params["bit_depth"] = result[14]
+        params["num_ser_ports"] = result[15]
+        params["extra_capab"] = result[16]
         return params
+    
+    def set_ccd_parameters(self, params):
+        # set CCD parameters
+        params = {**self.get_ccd_parameters(), **params} # fill empty fields with current values
+        payload = dec2bytes(params["hfront_porch"], 1) + dec2bytes(params["hback_porch"], 1) \
+                + dec2bytes(params["width"], 2) + dec2bytes(params["vfront_porch"], 1) \
+                + dec2bytes(params["vback_porch"], 1) + dec2bytes(params["height"], 2) \
+                + dec2bytes(int(params["pixel_width"]*256), 2) + dec2bytes(int(params["pixel_height"]*256), 2) \
+                + dec2bytes(params["color_matrix"], 2)
+
+        cmd = b'\x40\x07\x00\x00\x00\x00' + dec2bytes(len(payload)) + payload
+        write = self.dev.write(0x01, cmd, self.timeout)
+        return True
 
     def reset(self):
         # RESET
@@ -72,7 +88,7 @@ class Camera():
         # assert(exp_ms<65536,
         #         "exposure time (in ms) must be smaller than 6556 (roughly 65.5 sec)")
 
-        params = self.parameters()
+        params = self.get_ccd_parameters()
         # assert(width<=params["width"],
         #         "maximum width " + params["width"] + " pixels")
         # assert(height<=params["height"],
@@ -109,23 +125,57 @@ class Camera():
         image = dec2image( result1, h, w )
         return image
     
-    def readSensor_interlaced(self, exp_ms: float):
-        params = self.parameters()
+    def read_field(self, field: str, exp_ms: float):
+        # read either the even or odd field of an interlaced sensor
 
+        if field == "odd":
+            field = b'\x01\x00'
+        elif field == "even":
+            field = b'\x02\x00'
+        else:
+            raise ValueError("'field' must be either 'odd' or 'even'.")
+
+        params = self.get_ccd_parameters()
         w = params['width']
-        h = 2*params['height']
+        h = params['height']
         nPixels = w * h
+
         payload = b'\x00\x00\x00\x00' \
                     + dec2bytes(w) + dec2bytes(h) \
                     + b'\x01\x01'
-
-        cmd = b'\x40\x03\x04\x00\x00\x00' + dec2bytes(len(payload)) + payload
-
+        cmd = b'\x40\x03' + field + b'\x00\x00' + dec2bytes(len(payload)) + payload
+        # clear sensor
+        clear = self.dev.write(0x01, b'\x40\x01\x00\x00\x00\x00\x00\x00', self.timeout)
+        # write exposure command
         write = self.dev.write(0x01, cmd, self.timeout)
         sleep(exp_ms/1000)
+        # read exposure
         read = self.dev.read(0x82, 2*nPixels, 5*self.timeout)
 
-        image = np.frombuffer(read, dtype=np.uint16).reshape((h, w))
-        image = Image.fromarray(image, mode='I;16')
+        field = np.frombuffer(read, dtype=np.uint16).reshape((h, w))
+        return field
+
+    def read_interlaced_sensor(self, exp_ms: float):
+        # combine the odd and even fields of an interlaced sensor
+
+        # get odd and even fields
+        field_odd = self.read_field(field='odd', exp_ms=exp_ms)
+        field_even = self.read_field(field='even', exp_ms=exp_ms)
+
+        image = np.zeros((2*field_odd.shape[0], field_odd.shape[1]), dtype=field_odd.dtype)
+        # insert even field
+        image[::2] = field_even
+        # insert odd field
+        image[1::2] = field_odd
+
+        params = self.get_ccd_parameters()
+        if params['bit_depth'] == 16:
+            mode='I;16'
+        elif params['bit_depth'] == 8:
+            mode='I;8'
+        else:
+            raise ValueError(f"Unsupported bit depth: {params['bit_depth']}")
+
+        image = Image.fromarray(image, mode=mode)
         return image
 
